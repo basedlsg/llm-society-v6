@@ -1,0 +1,56 @@
+# LLM Society - Requirements
+# Python 3.11+ required
+
+# Agent-Based Modeling
+mesa>=1.0.0
+networkx>=2.6.0
+
+# AI/ML Providers
+google-generativeai>=0.3.0
+openai>=1.0.0
+anthropic>=0.5.0
+
+# Scientific Computing
+numpy>=1.21.0
+scipy>=1.7.0
+pandas>=1.3.0
+
+# CLI & UI
+typer>=0.9.0
+rich>=13.0.0
+click>=8.1.0
+
+# Web Framework
+fastapi>=0.95.0
+uvicorn[standard]>=0.20.0
+pydantic>=2.0.0
+
+# Async & HTTP
+aiohttp>=3.8.0
+httpx>=0.24.0
+aiofiles>=23.0.0
+
+# Database
+aiosqlite>=0.17.0
+sqlalchemy>=2.0.0
+
+# Monitoring & Visualization
+streamlit>=1.20.0
+plotly>=5.0.0
+matplotlib>=3.5.0
+wandb>=0.12.0
+
+# Configuration
+python-dotenv>=0.19.0
+pyyaml>=6.0
+
+# GPU Acceleration (optional)
+pycuda>=2022.1
+cupy>=11.0.0
+
+# Development
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+ruff>=0.1.0
+mypy>=1.0.0

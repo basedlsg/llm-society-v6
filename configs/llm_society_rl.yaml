@@ -1,0 +1,53 @@
+# LLM Society RL Environment Configuration
+#
+# This config is used with Atropos to run RL training on the survival world.
+#
+# Usage:
+#   python -m llm_society.rl.atropos_env serve --config configs/llm_society_rl.yaml
+
+# Environment configuration
+env:
+  # World settings
+  world_width: 20.0
+  world_height: 20.0
+  num_agents: 1  # Single agent for now
+  max_episode_steps: 200
+
+  # Energy dynamics (v1.1 values)
+  energy_decay: 0.02
+  rest_gain: 0.05
+  move_cost: 0.03
+  gather_cost: 0.04
+  talk_cost: 0.02
+
+  # Food dynamics
+  initial_food: 5
+  food_interval: 10
+  starvation_penalty: 0.1
+
+  # Social
+  social_radius: 3.0
+
+  # RL settings
+  reward_scale: 1.0
+  group_size: 4
+  max_token_length: 512
+  steps_per_eval: 100
+  total_steps: 1000
+
+  # Wandb
+  use_wandb: true
+  wandb_name: "llm_society_survival"
+
+# OpenAI-compatible API for policy inference
+# Replace with your inference server details
+openai:
+  model_name: "gpt-3.5-turbo"  # or your fine-tuned model
+  base_url: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"  # Set via environment variable
+  max_tokens: 50
+  temperature: 0.7
+  num_requests_for_eval: 10
+
+# Trajectory API server (if running distributed)
+# rollout_server_url: "http://localhost:8000"

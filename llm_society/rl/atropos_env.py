@@ -103,6 +103,11 @@ class SurvivalWorldConfig:
     social_bonus: float = 0.005  # Reward when within social_radius of another agent
     enable_social_bonus: bool = False  # Off by default (v1/v2 mode), on for v3
 
+    # v5: Stag Hunt cooperative gathering
+    enable_stag_hunt: bool = False  # Off by default
+    stag_hunt_radius: float = 2.0  # Must be within 2 units for cooperative gather
+    stag_hunt_food_bonus: int = 5  # +5 food instead of +1 when both gather together
+
     # Random seed
     seed: Optional[int] = None
 
@@ -113,6 +118,10 @@ class SurvivalWorld:
 
     This is a simplified version of the full LLM Society simulation,
     designed for fast RL rollouts without LLM calls or database operations.
+
+    V5 adds Stag Hunt mechanics: if two agents are within stag_hunt_radius
+    and both take gather_resources on the same step, each receives +5 food
+    instead of the normal +1-3.
     """
 
     # Valid action types
@@ -124,6 +133,10 @@ class SurvivalWorld:
         self.agents: Dict[str, Agent] = {}
         self.current_step = 0
 
+        # V5: Track pending actions for simultaneous resolution (Stag Hunt)
+        self.pending_actions: Dict[str, Dict[str, Any]] = {}
+        self.last_step_coop_gather: Dict[str, bool] = {}  # Track if cooperative gather happened
+
     def reset(self, seed: Optional[int] = None) -> Dict[str, Any]:
         """Reset the world and return initial observation."""
         if seed is not None:
@@ -131,6 +144,8 @@ class SurvivalWorld:
 
         self.current_step = 0
         self.agents = {}
+        self.pending_actions = {}
+        self.last_step_coop_gather = {}
 
         # Create agents
         for i in range(self.config.num_agents):
@@ -257,6 +272,137 @@ class SurvivalWorld:
 
         return obs, reward, done, info
 
+    def step_v5(
+        self,
+        actions: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Tuple[Dict[str, Any], float, bool, Dict]]:
+        """
+        V5: Execute one step for all agents simultaneously.
+
+        This is required for Stag Hunt mechanics where we need to check
+        if both agents gathered on the same step.
+
+        Args:
+            actions: Dict mapping agent_id -> action dict
+
+        Returns:
+            Dict mapping agent_id -> (observation, reward, done, info)
+        """
+        results = {}
+
+        # Check for cooperative gathering (Stag Hunt)
+        gathering_agents = []
+        for agent_id, action in actions.items():
+            if action.get("type") == "gather_resources":
+                gathering_agents.append(agent_id)
+
+        # Determine if cooperative gather conditions are met
+        cooperative_gather = False
+        if (self.config.enable_stag_hunt and
+            len(gathering_agents) == 2 and
+            self.config.num_agents == 2):
+            # Check if agents are within stag_hunt_radius
+            agent_0 = self.agents.get("agent_0")
+            agent_1 = self.agents.get("agent_1")
+            if agent_0 and agent_1:
+                dist = agent_0.position.distance_to(agent_1.position)
+                if dist <= self.config.stag_hunt_radius:
+                    cooperative_gather = True
+
+        # Process each agent
+        for agent_id, action in actions.items():
+            agent = self.agents.get(agent_id)
+            if agent is None:
+                results[agent_id] = ({}, 0.0, True, {"error": "Agent not found"})
+                continue
+
+            # Store previous state for reward calculation
+            prev_health = agent.health
+            prev_food = agent.food
+            prev_energy = agent.energy
+
+            # Apply baseline energy decay
+            agent.energy = max(0.0, agent.energy - self.config.energy_decay_per_step)
+
+            # Execute action
+            action_type = action.get("type", "rest")
+            params = action.get("params", {})
+            food_gained = 0
+
+            if action_type == "rest":
+                self._execute_rest(agent)
+            elif action_type == "move_to":
+                self._execute_move(agent, params)
+            elif action_type == "gather_resources":
+                # V5: Check if this is a cooperative gather
+                is_coop = cooperative_gather and agent_id in gathering_agents
+                food_gained = self._execute_gather(agent, cooperative=is_coop)
+                self.last_step_coop_gather[agent_id] = is_coop
+            elif action_type == "talk_to":
+                self._execute_talk(agent, params)
+            else:
+                self._execute_rest(agent)
+
+            # Food consumption
+            agent.step_count += 1
+            if agent.step_count % self.config.food_consumption_interval == 0:
+                agent.food = max(0, agent.food - 1)
+                if agent.food == 0:
+                    agent.health = max(0.0, agent.health - self.config.starvation_health_penalty)
+                    agent.energy = max(0.0, agent.energy - 0.05)
+
+            # Calculate reward
+            delta_health = agent.health - prev_health
+            delta_food = agent.food - prev_food
+
+            living_bonus = 0.01
+            health_reward = delta_health * 2.0
+            energy_penalty = -0.05 if agent.energy < 0.3 else 0.0
+            food_reward = 0.02 if agent.food >= 3 else (-0.02 if agent.food == 0 else 0.0)
+
+            # v3/v5: Social proximity bonus
+            social_bonus_reward = 0.0
+            is_near_other = False
+            if self.config.enable_social_bonus and self.config.num_agents > 1:
+                for other_id, other in self.agents.items():
+                    if other_id != agent_id:
+                        dist = agent.position.distance_to(other.position)
+                        if dist <= self.config.social_radius:
+                            social_bonus_reward = self.config.social_bonus
+                            is_near_other = True
+                            break
+
+            reward = living_bonus + health_reward + energy_penalty + food_reward + social_bonus_reward
+
+            # Check done conditions
+            done = (
+                agent.health <= 0 or
+                agent.energy <= 0 or
+                self.current_step >= self.config.max_steps - 1  # -1 because we increment below
+            )
+
+            # Get observation
+            obs = self._get_observation(agent_id)
+
+            info = {
+                "step": self.current_step + 1,
+                "action_type": action_type,
+                "delta_health": delta_health,
+                "delta_food": delta_food,
+                "survived": agent.health > 0 and agent.energy > 0,
+                "social_bonus": social_bonus_reward,
+                "is_near_other": is_near_other,
+                "cooperative_gather": self.last_step_coop_gather.get(agent_id, False),
+                "food_gained": food_gained,
+            }
+
+            results[agent_id] = (obs, reward, done, info)
+
+        # Increment global step counter once (not per agent)
+        self.current_step += 1
+
+        return results
+
     def _execute_rest(self, agent: Agent):
         """Rest action: recover energy."""
         agent.energy = min(1.0, agent.energy + self.config.rest_energy_gain)
@@ -274,14 +420,23 @@ class SurvivalWorld:
         agent.position = agent.position.move_towards(target, 1.0)  # Speed 1.0
         agent.energy = max(0.0, agent.energy - self.config.move_energy_cost)
 
-    def _execute_gather(self, agent: Agent):
-        """Gather action: get food."""
-        food_gain = self.rng.randint(
-            self.config.gather_food_min,
-            self.config.gather_food_max
-        )
+    def _execute_gather(self, agent: Agent, cooperative: bool = False):
+        """
+        Gather action: get food.
+
+        V5 Stag Hunt: If cooperative=True (both agents gathered within range),
+        agent receives stag_hunt_food_bonus (+5) instead of normal +1-3.
+        """
+        if cooperative and self.config.enable_stag_hunt:
+            food_gain = self.config.stag_hunt_food_bonus
+        else:
+            food_gain = self.rng.randint(
+                self.config.gather_food_min,
+                self.config.gather_food_max
+            )
         agent.food += food_gain
         agent.energy = max(0.0, agent.energy - self.config.gather_energy_cost)
+        return food_gain
 
     def _execute_talk(self, agent: Agent, params: Dict):
         """Talk action: interact with another agent."""

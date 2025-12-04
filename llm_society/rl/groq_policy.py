@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 ACTION_NAMES = ["rest", "gather_resources", "move_to", "talk_to"]
 ACTION_TO_IDX = {name: idx for idx, name in enumerate(ACTION_NAMES)}
 
+# V4 action mapping (no talk_to)
+ACTION_NAMES_V4 = ["rest", "gather_resources", "move_to"]
+ACTION_TO_IDX_V4 = {name: idx for idx, name in enumerate(ACTION_NAMES_V4)}
+
 
 def build_prompt(state: List[float], max_steps: int = 200) -> str:
     """
@@ -106,6 +110,43 @@ What is your action? Reply with exactly one word: rest, gather_resources, move_t
     return prompt
 
 
+def build_prompt_v4(state: List[float], other_agent_nearby: bool, distance_to_other: float, max_steps: int = 200) -> str:
+    """
+    Build the prompt for v4 (2-agent world, no talk_to action).
+
+    V4 focuses on: survival style, movement, and social proximity.
+    """
+    energy = state[0]
+    health = state[1]
+    food = int(state[2] * 10)  # denormalize
+    step = int(state[5] * max_steps)
+
+    # Presence information with distance
+    if other_agent_nearby:
+        presence_info = f"\n- Another agent is nearby ({distance_to_other:.1f} units away)"
+    else:
+        presence_info = f"\n- Another agent exists but is far ({distance_to_other:.1f} units away)"
+
+    prompt = f"""You are an agent trying to survive in a 20x20 world. You share this world with one other agent.
+
+Current state:
+- Energy: {energy:.2f} (dies if reaches 0)
+- Health: {health:.2f} (dies if reaches 0)
+- Food: {food} units (1 consumed every 10 steps; if 0, health drops)
+- Step: {step} of {max_steps}{presence_info}
+
+Actions available:
+- rest: +0.03 net energy (baseline decay -0.02, rest gives +0.05)
+- gather_resources: -0.06 net energy, but gives +1 to +3 food
+- move_to: -0.05 net energy, changes position in the world
+
+Your goal is to survive all {max_steps} steps.
+
+What is your action? Reply with exactly one word: rest, gather_resources, or move_to."""
+
+    return prompt
+
+
 def parse_action(response: str) -> Optional[int]:
     """
     Parse Groq's response to extract action index.
@@ -134,6 +175,34 @@ def parse_action(response: str) -> Optional[int]:
     return None
 
 
+def parse_action_v4(response: str) -> Optional[int]:
+    """
+    Parse response for v4 (no talk_to action).
+
+    Returns action index (0-2) or None if parsing fails.
+    """
+    response = response.strip().lower()
+
+    # Direct match
+    if response in ACTION_TO_IDX_V4:
+        return ACTION_TO_IDX_V4[response]
+
+    # Check if response contains exactly one action name
+    found_actions = [name for name in ACTION_NAMES_V4 if name in response]
+    if len(found_actions) == 1:
+        return ACTION_TO_IDX_V4[found_actions[0]]
+
+    # Check for common variations
+    if "gather" in response:
+        return ACTION_TO_IDX_V4["gather_resources"]
+    if "move" in response:
+        return ACTION_TO_IDX_V4["move_to"]
+    if "rest" in response:
+        return ACTION_TO_IDX_V4["rest"]
+
+    return None
+
+
 class GroqPolicy:
     """
     Policy that uses Groq to select actions in SurvivalWorld.
@@ -156,6 +225,7 @@ class GroqPolicy:
         max_retries: int = 1,
         fallback_action: int = 0,  # rest
         v2_mode: bool = False,
+        v4_mode: bool = False,
     ):
         """
         Initialize Groq policy.
@@ -167,6 +237,7 @@ class GroqPolicy:
             max_retries: Number of retries on parse failure
             fallback_action: Action index to use if all parsing fails
             v2_mode: If True, use v2 prompt with presence information
+            v4_mode: If True, use v4 prompt (no talk_to, focused on movement/proximity)
         """
         api_key = api_key or os.environ.get("GROQ_API_KEY")
         if not api_key:
@@ -178,17 +249,22 @@ class GroqPolicy:
         self.max_retries = max_retries
         self.fallback_action = fallback_action
         self.v2_mode = v2_mode
+        self.v4_mode = v4_mode
 
         # Tracking
         self.call_count = 0
         self.parse_failures = 0
         self.fallback_count = 0
 
+        # For v4: track distance for prompt building
+        self.current_distance_to_other = 10.0
+
         # For compatibility with trainer.py interface
         self.saved_log_probs = []
         self.rewards = []
 
-        logger.info(f"Initialized GroqPolicy with model={model_name}, temp={temperature}, v2={v2_mode}")
+        mode_str = "v4" if v4_mode else ("v2" if v2_mode else "v1")
+        logger.info(f"Initialized GroqPolicy with model={model_name}, temp={temperature}, mode={mode_str}")
 
     def select_action(self, state, other_agent_nearby: bool = False) -> Tuple[int, float]:
         """
@@ -196,7 +272,7 @@ class GroqPolicy:
 
         Args:
             state: numpy array or list of 8 state features
-            other_agent_nearby: Whether another agent is nearby (for v2 mode)
+            other_agent_nearby: Whether another agent is nearby (for v2/v4 mode)
 
         Returns:
             (action_index, log_prob) - log_prob is always 0.0 for LLM policy
@@ -205,10 +281,18 @@ class GroqPolicy:
         if hasattr(state, 'tolist'):
             state = state.tolist()
 
-        if self.v2_mode:
+        if self.v4_mode:
+            prompt = build_prompt_v4(state, other_agent_nearby, self.current_distance_to_other)
+            parser = parse_action_v4
+            retry_prompt = "You must answer with only one of: rest, gather_resources, move_to. No other words."
+        elif self.v2_mode:
             prompt = build_prompt_v2(state, other_agent_nearby)
+            parser = parse_action
+            retry_prompt = "You must answer with only one of: rest, gather_resources, move_to, talk_to. No other words."
         else:
             prompt = build_prompt(state)
+            parser = parse_action
+            retry_prompt = "You must answer with only one of: rest, gather_resources, move_to, talk_to. No other words."
 
         for attempt in range(self.max_retries + 1):
             try:
@@ -222,7 +306,7 @@ class GroqPolicy:
                 )
 
                 response_text = response.choices[0].message.content.strip()
-                action_idx = parse_action(response_text)
+                action_idx = parser(response_text)
 
                 if action_idx is not None:
                     return action_idx, 0.0
@@ -233,7 +317,7 @@ class GroqPolicy:
 
                 if attempt < self.max_retries:
                     # Retry with stricter prompt
-                    prompt = "You must answer with only one of: rest, gather_resources, move_to, talk_to. No other words."
+                    prompt = retry_prompt
 
             except Exception as e:
                 logger.warning(f"Groq API error on attempt {attempt + 1}: {e}")

@@ -137,6 +137,9 @@ class SimplePolicy:
 
 ACTION_NAMES = ["rest", "gather_resources", "move_to", "talk_to"]
 
+# V4 action space: talk_to removed to focus on survival, movement, and social proximity
+ACTION_NAMES_V4 = ["rest", "gather_resources", "move_to"]
+
 # State schema for trajectory logging (maps indices to feature names)
 STATE_SCHEMA = {
     0: "energy",           # 0.0-1.0, dies if reaches 0
@@ -184,6 +187,46 @@ def action_to_dict(action_idx: int, obs: Dict[str, Any]) -> Dict[str, Any]:
             return {"type": "talk_to", "params": {"target_id": target["id"]}}
         else:
             return {"type": "rest", "params": {}}
+    else:
+        return {"type": action_type, "params": {}}
+
+
+def action_to_dict_v4(action_idx: int, obs: Dict[str, Any], other_agent_pos: Optional[Tuple[float, float]] = None) -> Dict[str, Any]:
+    """
+    Convert action index to action dict for v4 (no talk_to).
+
+    V4 uses only: rest, gather_resources, move_to
+
+    For move_to, if other_agent_pos is provided, the RL agent will move toward it.
+    This allows the RL policy to express "seek proximity" behavior.
+
+    Note: If RL v3 policy outputs action 3 (talk_to), we map it to rest.
+    """
+    # Handle RL policies trained with 4 actions - map talk_to (3) to rest (0)
+    if action_idx >= len(ACTION_NAMES_V4):
+        action_idx = 0  # Default to rest
+
+    action_type = ACTION_NAMES_V4[action_idx]
+
+    if action_type == "move_to":
+        # If we know other agent's position, move toward them (for RL seeking behavior)
+        if other_agent_pos is not None:
+            return {
+                "type": "move_to",
+                "params": {
+                    "x": other_agent_pos[0],
+                    "y": other_agent_pos[1],
+                }
+            }
+        else:
+            # Random direction fallback
+            return {
+                "type": "move_to",
+                "params": {
+                    "x": random.uniform(0, obs.get("world_width", 20)),
+                    "y": random.uniform(0, obs.get("world_height", 20)),
+                }
+            }
     else:
         return {"type": action_type, "params": {}}
 
@@ -1343,9 +1386,15 @@ def run_v4_episode(
     V4 is the same physics as v3, but allows DIFFERENT policies per agent.
     This enables cross-policy matchups like RL v3 vs Gemini.
 
+    V4 changes from v3:
+    - Action space: rest, gather_resources, move_to (NO talk_to)
+    - Focus on survival style, movement, and social proximity
+
     Additional v4 metrics tracked:
     - who_approached_first: Which agent first moved toward the other
     - pursuit_index: (moves that shorten distance) / (total moves) per agent
+    - first_step_moved: First step when agent executed move_to (if ever)
+    - first_step_distance_decreased: First step when distance decreased (if ever)
     - distance_over_time: Full trajectory for visualization
 
     Returns:
@@ -1359,7 +1408,8 @@ def run_v4_episode(
         "agent_1": TrainingMetrics(),
     }
     for agent_id in metrics:
-        metrics[agent_id].action_counts = {name: 0 for name in ACTION_NAMES}
+        # V4 uses 3-action space (no talk_to)
+        metrics[agent_id].action_counts = {name: 0 for name in ACTION_NAMES_V4}
         metrics[agent_id].seed = world.config.seed
 
     # v4: Track social and interaction metrics
@@ -1368,10 +1418,18 @@ def run_v4_episode(
         "agent_1": {"steps_near": 0, "social_bonus_total": 0.0, "distances": []},
     }
 
-    # v4: Interaction metrics
+    # v4: Interaction metrics with enhanced tracking
     interaction_metrics = {
-        "agent_0": {"moves_toward": 0, "moves_away": 0, "total_moves": 0},
-        "agent_1": {"moves_toward": 0, "moves_away": 0, "total_moves": 0},
+        "agent_0": {
+            "moves_toward": 0, "moves_away": 0, "total_moves": 0,
+            "first_step_moved": None,
+            "first_step_distance_decreased": None,
+        },
+        "agent_1": {
+            "moves_toward": 0, "moves_away": 0, "total_moves": 0,
+            "first_step_moved": None,
+            "first_step_distance_decreased": None,
+        },
     }
     who_approached_first = None  # Will be set to "agent_0" or "agent_1"
     first_approach_step = None
@@ -1389,6 +1447,15 @@ def run_v4_episode(
         ),
     }
 
+    # Get initial distance
+    if "agent_0" in world.agents and "agent_1" in world.agents:
+        initial_dist = world.agents["agent_0"].position.distance_to(
+            world.agents["agent_1"].position
+        )
+    else:
+        initial_dist = float('inf')
+    prev_dist_for_decrease = initial_dist
+
     step = 0
     max_steps = world.config.max_steps
 
@@ -1403,7 +1470,7 @@ def run_v4_episode(
 
         prev_dist = dist  # Store for pursuit/avoid calculation
 
-        # Both agents act this round
+        # V4: Both agents act this round
         for agent_id, policy in [("agent_0", policy_a), ("agent_1", policy_b)]:
             if done[agent_id]:
                 continue
@@ -1411,19 +1478,36 @@ def run_v4_episode(
             obs = agent_obs[agent_id]
             state = obs_to_state(obs)
 
-            # Check if other agent is nearby
-            other_agent_nearby = len(obs.get("nearby_agents", [])) > 0
+            # Check if other agent is nearby (within social radius)
+            other_agent_nearby = dist < world.config.social_radius if dist != float('inf') else False
 
-            # Select action (v2/v3 policies accept other_agent_nearby)
-            if hasattr(policy, 'v2_mode') and policy.v2_mode:
+            # Update LLM policy's distance tracking for v4 prompts
+            if hasattr(policy, 'current_distance_to_other'):
+                policy.current_distance_to_other = dist
+
+            # Select action - v4 policies use v4_mode
+            if hasattr(policy, 'v4_mode') and policy.v4_mode:
+                action_idx, log_prob = policy.select_action(state, other_agent_nearby)
+            elif hasattr(policy, 'v2_mode') and policy.v2_mode:
                 action_idx, log_prob = policy.select_action(state, other_agent_nearby)
             else:
                 action_idx, log_prob = policy.select_action(state)
 
-            action = action_to_dict(action_idx, obs)
+            # Get other agent's position for move_to targeting
+            other_id = "agent_1" if agent_id == "agent_0" else "agent_0"
+            other_pos = None
+            if other_id in world.agents:
+                other_pos = (world.agents[other_id].position.x, world.agents[other_id].position.y)
+
+            # V4: Use 3-action space (no talk_to)
+            action = action_to_dict_v4(action_idx, obs, other_pos)
             action_type = action.get("type", "rest")
 
             metrics[agent_id].action_counts[action_type] = metrics[agent_id].action_counts.get(action_type, 0) + 1
+
+            # V4: Track first_step_moved
+            if action_type == "move_to" and interaction_metrics[agent_id]["first_step_moved"] is None:
+                interaction_metrics[agent_id]["first_step_moved"] = step
 
             # Log trajectory step
             if log_trajectory:
@@ -1437,7 +1521,7 @@ def run_v4_episode(
                         "food": obs["food"],
                         "position_x": obs.get("position_x", 0),
                         "position_y": obs.get("position_y", 0),
-                        "nearby_agents": len(obs.get("nearby_agents", [])),
+                        "nearby_agents": 1 if other_agent_nearby else 0,
                     },
                     "distance_to_other": dist,
                 })
@@ -1463,6 +1547,9 @@ def run_v4_episode(
                     if who_approached_first is None:
                         who_approached_first = agent_id
                         first_approach_step = step
+                    # V4: Track first_step_distance_decreased
+                    if interaction_metrics[agent_id]["first_step_distance_decreased"] is None:
+                        interaction_metrics[agent_id]["first_step_distance_decreased"] = step
                 elif new_dist > prev_dist:
                     interaction_metrics[agent_id]["moves_away"] += 1
 
@@ -1522,6 +1609,7 @@ def run_v4_episode(
 
     shared_info = {
         "total_steps": step,
+        "initial_distance": initial_dist,
         "both_survived": all(m.survived for m in metrics.values()),
         "social_metrics": social_metrics,
         "interaction_metrics": interaction_metrics,
@@ -1544,6 +1632,8 @@ def evaluate_v4_policy(
     """
     Evaluate two DIFFERENT policies in v4 (mixed policy world).
 
+    V4 uses 3-action space: rest, gather_resources, move_to (no talk_to)
+
     Returns per-agent results plus shared metrics including interaction stats.
     """
     results = {
@@ -1552,24 +1642,28 @@ def evaluate_v4_policy(
             "avg_reward": 0.0,
             "survival_rate": 0.0,
             "avg_length": 0.0,
-            "action_dist": {name: 0.0 for name in ACTION_NAMES},
+            "action_dist": {name: 0.0 for name in ACTION_NAMES_V4},
             "avg_social_bonus": 0.0,
             "social_uptime": 0.0,
             "avg_distance": 0.0,
             "pursuit_index": 0.0,
             "avoid_index": 0.0,
+            "first_step_moved_avg": None,
+            "first_step_distance_decreased_avg": None,
         },
         "agent_1": {
             "policy_name": policy_b_name,
             "avg_reward": 0.0,
             "survival_rate": 0.0,
             "avg_length": 0.0,
-            "action_dist": {name: 0.0 for name in ACTION_NAMES},
+            "action_dist": {name: 0.0 for name in ACTION_NAMES_V4},
             "avg_social_bonus": 0.0,
             "social_uptime": 0.0,
             "avg_distance": 0.0,
             "pursuit_index": 0.0,
             "avoid_index": 0.0,
+            "first_step_moved_avg": None,
+            "first_step_distance_decreased_avg": None,
         },
         "shared": {
             "both_survived_rate": 0.0,
@@ -1581,14 +1675,16 @@ def evaluate_v4_policy(
     per_agent_survival = {"agent_0": [], "agent_1": []}
     per_agent_lengths = {"agent_0": [], "agent_1": []}
     per_agent_action_totals = {
-        "agent_0": {name: 0 for name in ACTION_NAMES},
-        "agent_1": {name: 0 for name in ACTION_NAMES},
+        "agent_0": {name: 0 for name in ACTION_NAMES_V4},
+        "agent_1": {name: 0 for name in ACTION_NAMES_V4},
     }
     per_agent_social_bonus = {"agent_0": [], "agent_1": []}
     per_agent_steps_near = {"agent_0": [], "agent_1": []}
     per_agent_avg_distance = {"agent_0": [], "agent_1": []}
     per_agent_pursuit_index = {"agent_0": [], "agent_1": []}
     per_agent_avoid_index = {"agent_0": [], "agent_1": []}
+    per_agent_first_step_moved = {"agent_0": [], "agent_1": []}
+    per_agent_first_step_distance_decreased = {"agent_0": [], "agent_1": []}
 
     both_survived = []
     who_approached_counts = {"agent_0": 0, "agent_1": 0, "neither": 0}
@@ -1633,10 +1729,17 @@ def evaluate_v4_policy(
             per_agent_pursuit_index[agent_id].append(im["pursuit_index"])
             per_agent_avoid_index[agent_id].append(im["avoid_index"])
 
+            # V4 enhanced metrics
+            if im["first_step_moved"] is not None:
+                per_agent_first_step_moved[agent_id].append(im["first_step_moved"])
+            if im["first_step_distance_decreased"] is not None:
+                per_agent_first_step_distance_decreased[agent_id].append(im["first_step_distance_decreased"])
+
             if log_trajectory:
                 episodes[agent_id].append({
                     "episode_index": i,
                     "seed": m.seed,
+                    "initial_distance": shared["initial_distance"],
                     "trajectory": m.trajectory,
                     "total_reward": m.total_reward,
                     "survived": m.survived,
@@ -1652,6 +1755,8 @@ def evaluate_v4_policy(
                     "avg_distance": sm["avg_distance"],
                     "pursuit_index": im["pursuit_index"],
                     "avoid_index": im["avoid_index"],
+                    "first_step_moved": im["first_step_moved"],
+                    "first_step_distance_decreased": im["first_step_distance_decreased"],
                 })
 
     # Compute averages
@@ -1680,6 +1785,14 @@ def evaluate_v4_policy(
         # Interaction metrics averages
         results[agent_id]["pursuit_index"] = sum(per_agent_pursuit_index[agent_id]) / len(per_agent_pursuit_index[agent_id])
         results[agent_id]["avoid_index"] = sum(per_agent_avoid_index[agent_id]) / len(per_agent_avoid_index[agent_id])
+
+        # V4 enhanced metrics averages
+        fsm = per_agent_first_step_moved[agent_id]
+        fsd = per_agent_first_step_distance_decreased[agent_id]
+        results[agent_id]["first_step_moved_avg"] = sum(fsm) / len(fsm) if fsm else None
+        results[agent_id]["first_step_distance_decreased_avg"] = sum(fsd) / len(fsd) if fsd else None
+        results[agent_id]["episodes_with_movement"] = len(fsm)
+        results[agent_id]["episodes_with_approach"] = len(fsd)
 
         if log_trajectory:
             results[agent_id]["episodes"] = episodes[agent_id]
@@ -1810,8 +1923,10 @@ def run_v4_benchmark(
     policies = {}
 
     # Load RL v3 policy
+    # Note: RL v3 was trained with 4 actions but we use 3-action space in v4
+    # The first 3 actions (rest, gather, move) are the same, so it works
     if rl_v3_policy_path and Path(rl_v3_policy_path).exists():
-        policy_config = PolicyConfig()
+        policy_config = PolicyConfig(action_dim=3)  # V4: 3 actions
         rl_v3_policy = SimplePolicy(policy_config)
         rl_v3_policy.load(rl_v3_policy_path)
         rl_v3_policy.v2_mode = False
@@ -1820,21 +1935,21 @@ def run_v4_benchmark(
     else:
         logger.warning(f"RL v3 policy not found at {rl_v3_policy_path}")
 
-    # Load Gemini policy
+    # Load Gemini policy with v4 mode (no talk_to)
     if include_gemini:
         try:
             from llm_society.rl.gemini_policy import GeminiPolicy
-            policies["gemini"] = GeminiPolicy(temperature=0.0, v2_mode=True)
-            logger.info("Loaded Gemini policy")
+            policies["gemini"] = GeminiPolicy(temperature=0.0, v4_mode=True)
+            logger.info("Loaded Gemini policy (v4 mode)")
         except Exception as e:
             logger.warning(f"Could not load Gemini policy: {e}")
 
-    # Load Groq policy
+    # Load Groq policy with v4 mode (no talk_to)
     if include_groq:
         try:
             from llm_society.rl.groq_policy import GroqPolicy
-            policies["groq"] = GroqPolicy(temperature=0.0, v2_mode=True)
-            logger.info("Loaded Groq policy")
+            policies["groq"] = GroqPolicy(temperature=0.0, v4_mode=True)
+            logger.info("Loaded Groq policy (v4 mode)")
         except Exception as e:
             logger.warning(f"Could not load Groq policy: {e}")
 
